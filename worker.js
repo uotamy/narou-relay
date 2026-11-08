@@ -1,10 +1,10 @@
-// Narou relay for Cloudflare Workers.
-// Fetches syosetu content server-side and returns it with CORS headers,
-// so a web page (PWA) can use it despite the origin's lack of CORS.
-// Upstream is restricted to syosetu hosts, and responses are cached
+// Content relay for Cloudflare Workers.
+// Fetches syosetu / aozora content server-side and returns it with CORS
+// headers, so a web page (PWA) can use it despite the origins' lack of
+// CORS. Upstream is restricted to those hosts, and responses are cached
 // (1h) to be gentle on the origin.
 const ALLOWED = [
-  /^https:\/\/([a-z0-9-]+\.)?syosetu\.com\//i,
+  /^https:\/\/([a-z0-9-]+\.)?(syosetu\.com|aozora\.gr\.jp)\//i,
 ];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
