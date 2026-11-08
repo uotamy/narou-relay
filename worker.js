@@ -4,7 +4,7 @@
 // CORS. Upstream is restricted to those hosts, and responses are cached
 // (1h) to be gentle on the origin.
 const ALLOWED = [
-  /^https:\/\/([a-z0-9-]+\.)?(syosetu\.com|aozora\.gr\.jp)\//i,
+  /^https:\/\/([a-z0-9-]+\.)?(syosetu\.com|aozora\.gr\.jp|kakuyomu\.jp)\//i,
 ];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
