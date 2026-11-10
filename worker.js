@@ -113,6 +113,67 @@ function searchIndex(blob, q) {
   return { total: lines.length, items };
 }
 
+// Aggregate the KV search log into counts for the operations
+// dashboard: totals by source, today's counts (JST), and a per-day
+// breakdown. Handles both key shapes: the retired daily-array key
+// ("log:YYYY-MM-DD", value = JSON array) and the current per-entry
+// keys ("log:YYYY-MM-DD:<ISO time>:<random>", value = one entry).
+// Cached for 5 minutes so dashboard refreshes stay gentle on KV.
+async function statsResponse(env, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request('https://narou-relay.internal/stats-v1', { method: 'GET' });
+  const hit = await cache.match(cacheKey);
+  if (hit) return hit;
+  const byDay = {};
+  const bySrc = { aozora: 0, narou: 0 };
+  let total = 0;
+  const add = (day, src) => {
+    if (!byDay[day]) byDay[day] = { date: day, aozora: 0, narou: 0, total: 0 };
+    byDay[day].total += 1;
+    total += 1;
+    if (src === 'aozora' || src === 'narou') {
+      byDay[day][src] += 1;
+      bySrc[src] += 1;
+    }
+  };
+  try {
+    if (env && env.LOG_KV) {
+      let cursor;
+      let scanned = 0;
+      do {
+        const page = await env.LOG_KV.list({ prefix: 'log:', cursor, limit: 1000 });
+        for (const k of page.keys) {
+          const day = k.name.slice(4, 14);
+          if (k.name.length === 14) {
+            const arr = await env.LOG_KV.get(k.name, 'json');
+            if (Array.isArray(arr)) for (const e of arr) add(day, e && e.src);
+          } else if (scanned < 500) {
+            scanned += 1;
+            const e = await env.LOG_KV.get(k.name, 'json');
+            if (e) add(day, e.src);
+          }
+        }
+        cursor = page.list_complete ? undefined : page.cursor;
+      } while (cursor);
+    }
+  } catch (e) { /* return whatever was aggregated */ }
+  const jst = new Date(Date.now() + 9 * 3600 * 1000);
+  const todayStr = jst.toISOString().slice(0, 10);
+  const days = Object.values(byDay).sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 14);
+  const out = {
+    updated: new Date().toISOString(),
+    total,
+    bySrc,
+    today: byDay[todayStr] || { date: todayStr, aozora: 0, narou: 0, total: 0 },
+    days,
+  };
+  const res = new Response(JSON.stringify(out), {
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=300', ...corsHeaders() },
+  });
+  ctx.waitUntil(cache.put(cacheKey, res.clone()));
+  return res;
+}
+
 async function aozoraSearch(request, env, ctx) {
   const url = new URL(request.url);
   const q = (url.searchParams.get('q') || '').trim();
@@ -136,6 +197,9 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/api/aozora/search') {
       return aozoraSearch(request, env, ctx);
+    }
+    if (url.pathname === '/api/stats') {
+      return statsResponse(env, ctx);
     }
     const target = url.searchParams.get('url');
     if (!target || !ALLOWED.some((re) => re.test(target))) {
