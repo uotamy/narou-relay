@@ -1,3 +1,7 @@
 name = "narou-relay"
 main = "worker.js"
 compatibility_date = "2024-11-01"
+
+[[kv_namespaces]]
+binding = "LOG_KV"
+id = "d52b3b50dc414dd4a1195eeba0e143de"

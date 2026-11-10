@@ -3,10 +3,26 @@
 // headers, so a web page (PWA) can use it despite the origins' lack of
 // CORS. Upstream is restricted to those hosts, and responses are cached
 // (1h) to be gentle on the origin.
+//
+// Added 2026-11-11:
+// - GET /api/aozora/search?q=... : server-side search over the Aozora
+//   Bunko works index. The index (index.txt in this repo, built from the
+//   official list_person_all_extended_utf8.zip with the same rules the
+//   app used on-device: public-domain works only, deduped by text-file
+//   URL) is fetched once and held in the Cache API, so aozora.gr.jp is
+//   not hit per search and every client shares one copy.
+// - Search logging: aozora searches and narou API searches (novelapi
+//   calls carrying a `word` parameter) are appended to a KV log
+//   (binding LOG_KV, key "log:YYYY-MM-DD" in JST, JSON array of
+//   {t, src, q, n}). Only the query text, source and result count are
+//   stored -- no IP address, no user agent, no identifiers.
 const ALLOWED = [
   /^https:\/\/([a-z0-9-]+\.)?(syosetu\.com|aozora\.gr\.jp|kakuyomu\.jp)\//i,
 ];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const INDEX_URL = 'https://raw.githubusercontent.com/uotamy/narou-relay/main/index.txt';
+const INDEX_CACHE_KEY = 'https://narou-relay.internal/aozora-index-v1';
+const SEARCH_CAP = 60;
 
 function corsHeaders() {
   return {
@@ -16,16 +32,123 @@ function corsHeaders() {
   };
 }
 
+function jsonResponse(obj, status) {
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders() },
+  });
+}
+
+async function logSearch(env, src, q, n) {
+  if (!env || !env.LOG_KV || !q) return;
+  try {
+    const jst = new Date(Date.now() + 9 * 3600 * 1000);
+    const day = jst.toISOString().slice(0, 10);
+    const key = 'log:' + day;
+    const cur = await env.LOG_KV.get(key, 'json');
+    const arr = Array.isArray(cur) ? cur : [];
+    arr.push({ t: new Date().toISOString(), src, q, n });
+    if (arr.length > 5000) arr.splice(0, arr.length - 5000);
+    await env.LOG_KV.put(key, JSON.stringify(arr));
+  } catch (e) { /* logging must never break a request */ }
+}
+
+async function loadIndex(ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(INDEX_CACHE_KEY, { method: 'GET' });
+  const hit = await cache.match(cacheKey);
+  if (hit) return await hit.text();
+  const up = await fetch(INDEX_URL);
+  if (!up.ok) throw new Error('index fetch failed: ' + up.status);
+  const text = await up.text();
+  const store = new Response(text, {
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=604800' },
+  });
+  ctx.waitUntil(cache.put(cacheKey, store.clone()));
+  return text;
+}
+
+// Index line format: searchText \t title \t subtitle \t author \t textZipUrl
+// searchText is the lowercased "title subtitle author yomi..." string,
+// identical to what the app built on-device. A query word only counts
+// when it occurs inside searchText (before the first tab), exactly like
+// the on-device substring match. Multiple words are ANDed; the app also
+// split on ASCII/fullwidth spaces.
+function searchIndex(blob, q) {
+  const words = q.toLowerCase().split(/[\s　]+/).filter(Boolean);
+  if (!words.length) return { total: 0, items: [] };
+  let lines = null;
+  for (const w of words) {
+    const found = [];
+    let pos = 0;
+    while (pos <= blob.length) {
+      const i = blob.indexOf(w, pos);
+      if (i < 0) break;
+      const ls = blob.lastIndexOf('\n', i) + 1;
+      const tab = blob.indexOf('\t', ls);
+      if (tab >= 0 && i < tab) {
+        let le = blob.indexOf('\n', ls);
+        if (le < 0) le = blob.length;
+        found.push(blob.slice(ls, le));
+        pos = le + 1;
+        if (found.length >= 5000) break;
+      } else {
+        pos = i + w.length;
+      }
+    }
+    if (lines === null) lines = found;
+    else {
+      const set = new Set(found);
+      lines = lines.filter((l) => set.has(l));
+    }
+    if (!lines.length) break;
+  }
+  const items = lines.slice(0, SEARCH_CAP).map((line) => {
+    const p = line.split('\t');
+    return { t: p[1] || '', sub: p[2] || '', a: p[3] || '', u: p[4] || '' };
+  });
+  return { total: lines.length, items };
+}
+
+async function aozoraSearch(request, env, ctx) {
+  const url = new URL(request.url);
+  const q = (url.searchParams.get('q') || '').trim();
+  if (!q) return jsonResponse({ total: 0, items: [] });
+  let blob;
+  try {
+    blob = await loadIndex(ctx);
+  } catch (e) {
+    return jsonResponse({ error: 'index_unavailable' }, 503);
+  }
+  const r = searchIndex(blob, q);
+  ctx.waitUntil(logSearch(env, 'aozora', q, r.total));
+  return jsonResponse(r);
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders() });
     }
     const url = new URL(request.url);
+    if (url.pathname === '/api/aozora/search') {
+      return aozoraSearch(request, env, ctx);
+    }
     const target = url.searchParams.get('url');
     if (!target || !ALLOWED.some((re) => re.test(target))) {
       return new Response('forbidden target', { status: 403, headers: corsHeaders() });
     }
+
+    // Narou keyword searches go through the novel API with a `word`
+    // parameter; log them server-side (the response itself is proxied
+    // untouched below).
+    try {
+      const t = new URL(target);
+      if (t.hostname === 'api.syosetu.com' && t.pathname.indexOf('/novelapi/') === 0) {
+        const w = (t.searchParams.get('word') || '').trim();
+        if (w) ctx.waitUntil(logSearch(env, 'narou', w, null));
+      }
+    } catch (e) { /* ignore */ }
 
     const cache = caches.default;
     const cacheKey = new Request(target, { method: 'GET' });
