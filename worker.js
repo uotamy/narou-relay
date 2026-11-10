@@ -12,10 +12,14 @@
 //   URL) is fetched once and held in the Cache API, so aozora.gr.jp is
 //   not hit per search and every client shares one copy.
 // - Search logging: aozora searches and narou API searches (novelapi
-//   calls carrying a `word` parameter) are appended to a KV log
-//   (binding LOG_KV, key "log:YYYY-MM-DD" in JST, JSON array of
-//   {t, src, q, n}). Only the query text, source and result count are
-//   stored -- no IP address, no user agent, no identifiers.
+//   calls carrying a `word` parameter) are written to a KV log
+//   (binding LOG_KV), one entry per key:
+//   "log:YYYY-MM-DD:<ISO time>:<random>" (day in JST), value = a single
+//   JSON object {t, src, q, n}. Per-entry keys avoid the
+//   read-modify-write race that a single daily array key has under
+//   KV's eventual consistency (an early version lost an entry that
+//   way). Only the query text, source and result count are stored --
+//   no IP address, no user agent, no identifiers.
 const ALLOWED = [
   /^https:\/\/([a-z0-9-]+\.)?(syosetu\.com|aozora\.gr\.jp|kakuyomu\.jp)\//i,
 ];
@@ -42,14 +46,13 @@ function jsonResponse(obj, status) {
 async function logSearch(env, src, q, n) {
   if (!env || !env.LOG_KV || !q) return;
   try {
-    const jst = new Date(Date.now() + 9 * 3600 * 1000);
+    const now = new Date();
+    const jst = new Date(now.getTime() + 9 * 3600 * 1000);
     const day = jst.toISOString().slice(0, 10);
-    const key = 'log:' + day;
-    const cur = await env.LOG_KV.get(key, 'json');
-    const arr = Array.isArray(cur) ? cur : [];
-    arr.push({ t: new Date().toISOString(), src, q, n });
-    if (arr.length > 5000) arr.splice(0, arr.length - 5000);
-    await env.LOG_KV.put(key, JSON.stringify(arr));
+    const entry = { t: now.toISOString(), src, q, n };
+    const suffix = Math.random().toString(36).slice(2, 10);
+    const key = 'log:' + day + ':' + entry.t + ':' + suffix;
+    await env.LOG_KV.put(key, JSON.stringify(entry));
   } catch (e) { /* logging must never break a request */ }
 }
 
