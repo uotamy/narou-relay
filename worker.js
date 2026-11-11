@@ -20,6 +20,21 @@
 //   KV's eventual consistency (an early version lost an entry that
 //   way). Only the query text, source and result count are stored --
 //   no IP address, no user agent, no identifiers.
+//
+// Added 2026-11-12:
+// - POST /api/log/shelf : bookshelf-add logging. The app sends one
+//   explicit event at the moment a book is added to the shelf (never
+//   inferred from proxy traffic, which cannot distinguish a fetch
+//   from an add). Body (JSON): {src: "aozora"|"narou", id, title,
+//   author, via} -- id is the Aozora text-file URL or the Narou
+//   ncode; via is the entry point: "search" | "recommend" |
+//   "ranking" | "direct". Stored in the same KV under a separate
+//   prefix, one entry per key: "add:YYYY-MM-DD:<ISO time>:<random>"
+//   (day in JST), value = {t, src, id, title, author, via}. Only
+//   book metadata is stored -- no IP address, no user agent, no
+//   identifiers, same policy as the search log. Aggregation /
+//   ranking display is intentionally NOT done yet; this only
+//   accumulates the raw events.
 const ALLOWED = [
   /^https:\/\/([a-z0-9-]+\.)?(syosetu\.com|aozora\.gr\.jp|kakuyomu\.jp)\//i,
 ];
@@ -31,7 +46,7 @@ const SEARCH_CAP = 60;
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': '*',
   };
 }
@@ -54,6 +69,47 @@ async function logSearch(env, src, q, n) {
     const key = 'log:' + day + ':' + entry.t + ':' + suffix;
     await env.LOG_KV.put(key, JSON.stringify(entry));
   } catch (e) { /* logging must never break a request */ }
+}
+
+const SHELF_SRCS = { aozora: 1, narou: 1 };
+const SHELF_VIAS = { search: 1, recommend: 1, ranking: 1, direct: 1 };
+
+// POST /api/log/shelf -- one explicit bookshelf-add event from the
+// app. Validates and truncates the fields, then stores the entry in
+// LOG_KV under the "add:" prefix (same per-entry key scheme as the
+// search log). Always answers 200/400 JSON; a KV failure is reported
+// as 503 so the caller can tell, but the app treats logging as
+// fire-and-forget and never blocks a registration on it.
+async function shelfLog(request, env) {
+  if (!env || !env.LOG_KV) return jsonResponse({ ok: false, error: 'kv_unavailable' }, 503);
+  let b;
+  try { b = await request.json(); } catch (e) { return jsonResponse({ ok: false, error: 'bad_json' }, 400); }
+  if (!b || typeof b !== 'object') return jsonResponse({ ok: false, error: 'bad_body' }, 400);
+  const src = String(b.src || '');
+  const id = String(b.id || '').slice(0, 500);
+  const via = String(b.via || '');
+  if (!SHELF_SRCS[src] || !id || !SHELF_VIAS[via]) {
+    return jsonResponse({ ok: false, error: 'bad_fields' }, 400);
+  }
+  const now = new Date();
+  const jst = new Date(now.getTime() + 9 * 3600 * 1000);
+  const day = jst.toISOString().slice(0, 10);
+  const entry = {
+    t: now.toISOString(),
+    src,
+    id,
+    title: String(b.title || '').slice(0, 300),
+    author: String(b.author || '').slice(0, 300),
+    via,
+  };
+  const suffix = Math.random().toString(36).slice(2, 10);
+  const key = 'add:' + day + ':' + entry.t + ':' + suffix;
+  try {
+    await env.LOG_KV.put(key, JSON.stringify(entry));
+  } catch (e) {
+    return jsonResponse({ ok: false, error: 'kv_put_failed' }, 503);
+  }
+  return jsonResponse({ ok: true });
 }
 
 async function loadIndex(ctx) {
@@ -200,6 +256,10 @@ export default {
     }
     if (url.pathname === '/api/stats') {
       return statsResponse(env, ctx);
+    }
+    if (url.pathname === '/api/log/shelf') {
+      if (request.method !== 'POST') return jsonResponse({ ok: false, error: 'method_not_allowed' }, 405);
+      return shelfLog(request, env);
     }
     const target = url.searchParams.get('url');
     if (!target || !ALLOWED.some((re) => re.test(target))) {
